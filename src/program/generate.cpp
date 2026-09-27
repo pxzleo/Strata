@@ -34,6 +34,7 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -277,6 +278,8 @@ void usage() {
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
                  "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
+                 "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
+                 "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -745,11 +748,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
         return 2;
     }
-    if (o.kv != "fp16" && o.kv != "int8") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16 or int8\n");
+    if (o.kv == "q4") o.kv = "q4_0";
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8 or q4_0\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
+    strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
         return 2;
@@ -1271,21 +1276,22 @@ int main(int argc, char** argv) {
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
+        // The old GPU-hit fault behind the Round 328 warning was fixed upstream (issue #23).
+        // CPU and GPU experts can still round differently; the Q2_0 comparison in
+        // bench/results/2026-09-27-cache-parity does not measure this native IQ pack.
         if (native_pack) {
             if (o.pcie_frac >= 1.0) {
                 std::fprintf(stderr, "strata generate: native experts use the GPU for both VRAM hits and PCIe misses; "
-                                     "CPU-only output can differ because its quantization differs.\n");
+                                     "CPU-only output can differ because expert arithmetic rounds differently.\n");
             } else {
-                std::fprintf(stderr, "strata generate: WARNING: native GPU hits and CPU misses use different "
-                                     "arithmetic; output can depend on cache residency.\n");
+                std::fprintf(stderr, "strata generate: native GPU hits and CPU misses round differently; "
+                                     "output can depend on cache residency.\n");
             }
         } else {
-            // The Q2_0 hit path still has the measured ROUND 328 divergence from its CPU-only run.
             std::fprintf(stderr,
-                         "strata generate: *** WARNING: --expert-cache is enabled and the GPU hit path is NOT\n"
-                         "                 CORRECT. The generated tokens diverge from a cache-off run (measured:\n"
-                         "                 first difference at token 40 at 2.97%% hits, token 0 at 54.4%%). Any\n"
-                         "                 timing from this run is real; any OUTPUT from it is not. ***\n");
+                         "strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
+                         "                 so a reply can differ slightly from a run without the cache (same quality:\n"
+                         "                 bench/results/2026-09-27-cache-parity).\n");
         }
         if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
@@ -2200,6 +2206,18 @@ int main(int argc, char** argv) {
                          (long long) (free_b >> 20), free_b < ((size_t) 128 << 20)
                              ? " - LOW: requests may stall; lower --max-context or raise --vram-reserve-mib" : "");
         }
+        // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
+        {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
+                        "mtp_max=%d lookup=%d vram_free_mib=%lld\n",
+                        (long long) o.max_context, o.kv.c_str(),
+                        (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
+                                         ? ss.qsa_states[0].n_slots * 4 : 0),
+                        (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
+                        o.suffix_draft, (long long) (free_b >> 20));
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -2724,6 +2742,19 @@ int main(int argc, char** argv) {
                 uint64_t h_ple = hash_dev(ss.ple_hist, z.ple, 1469598103934665603ull);
                 uint64_t h_tail = 1469598103934665603ull, h_pool = h_tail, h_kv = h_tail, h_stale = h_tail;
                 const int64_t kvb = qs.head_dim, scb = (qs.head_dim / 64) * 2;
+                // a state's K/V arrays and their bytes per (cell, head) row: the host copy when it has one
+                auto kv_arrays = [&](const strata::core::QsaState& st) {
+                    const bool h = st.kv_mode != 0;
+                    std::vector<std::pair<const void*, int64_t>> a;
+                    if (st.kv_q4) {
+                        const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
+                        a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
+                    } else {
+                        a = {{h ? st.host.k_q : st.k_q, kvb}, {h ? st.host.v_q : st.v_q, kvb},
+                             {h ? st.host.k_scale : st.k_scale, scb}, {h ? st.host.v_scale : st.v_scale, scb}};
+                    }
+                    return a;
+                };
                 const int64_t end_cell = std::min<int64_t>(((L + qs.page_size - 1) / qs.page_size) * qs.page_size,
                                                            ss.qsa_states[0].max_cells);
                 for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
@@ -2731,11 +2762,7 @@ int main(int argc, char** argv) {
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
                     h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
                     // KV streaming: the host copy is the identity layout and holds every cell
-                    const bool hs = st.kv_mode != 0;
-                    for (const auto& [pool, w] : {std::pair<const void*, int64_t>{hs ? st.host.k_q : st.k_q, kvb},
-                                                  {hs ? st.host.v_q : st.v_q, kvb},
-                                                  {hs ? st.host.k_scale : st.k_scale, scb},
-                                                  {hs ? st.host.v_scale : st.v_scale, scb}}) {
+                    for (const auto& [pool, w] : kv_arrays(st)) {
                         h_kv = hash_cells(pool, w, 0, L, h_kv);
                         h_stale = hash_cells(pool, w, L, end_cell, h_stale);
                     }
@@ -2743,11 +2770,7 @@ int main(int argc, char** argv) {
                 const strata::core::QsaState& ms = mtp.kv_state();
                 uint64_t h_mtp = 1469598103934665603ull;
                 const int64_t mL = std::min<int64_t>(L, ms.max_cells);
-                const bool mh = ms.kv_mode != 0;
-                for (const auto& [pool, w] : {std::pair<const void*, int64_t>{mh ? ms.host.k_q : ms.k_q, kvb},
-                                              {mh ? ms.host.v_q : ms.v_q, kvb},
-                                              {mh ? ms.host.k_scale : ms.k_scale, scb},
-                                              {mh ? ms.host.v_scale : ms.v_scale, scb}})
+                for (const auto& [pool, w] : kv_arrays(ms))
                     if (pool != nullptr) h_mtp = hash_cells(pool, w, 0, mL, h_mtp);
                 std::fprintf(stderr, "strata serve: STATE_HASH L=%lld gdn=%016llx ple=%016llx tail=%016llx pooled=%016llx "
                                      "kv=%016llx mtp=%016llx stale=%016llx ple_prev=%d,%d\n", (long long) L,

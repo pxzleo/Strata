@@ -42,6 +42,11 @@ attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU.
 costs ~13.7 KB of RAM per context token (1.7 GB at 128K). Existing installs: run `START-HERE.bat --setup` once to turn
 it on.
 
+**4-bit KV cache (engine 0.1.8, optional):** `START-HERE.bat --setup` asks above 8K context (or pass `--kv q4_0`). It
+halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR #21), about 4% faster at 128K, but it
+is measurably less precise on long documents (perplexity +8-12%; needle tests still pass). 8-bit stays the default.
+Details: [`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md).
+
 Time to first token is prompt length / prompt speed: about 7 s at 4K, 55 s at 32K, 4 minutes at 128K and 9 minutes at
 262K. The raw numbers: [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
 
@@ -125,8 +130,16 @@ Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GP
 4. **Images?** yes / no (see [Images](#images-vision)).
 
 Then it downloads and prepares everything (the model is 66-76 GB, so the first start takes a while; an interrupted
-download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, a small
-page that shows it is running and lets you chat. The API is at `http://127.0.0.1:8080/v1` for your apps.
+download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, the Strata
+app. It has three tabs:
+- **Chat:** streaming answers, the model's thinking (folded away once it answers), code with a copy button, pictures when
+  images are on, and sampling and thinking-level settings. Chats stay in your browser.
+- **Monitor:** what the model is doing (reading the prompt, with progress, or writing, at how many tokens/s); GPU load,
+  VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
+- **About:** the model and engine settings, and the addresses to connect other apps.
+
+`http://127.0.0.1:8080/?q=your question` opens it with a new chat already asking. The API is at
+`http://127.0.0.1:8080/v1` for your apps.
 
 **Every time after that**, `START-HERE.bat` just starts the model (30-90 s to load 34-43 GB into RAM). Nothing is
 downloaded again. Closing the window stops the model.
@@ -171,6 +184,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | Model list / health | `GET /v1/models`, `GET /health` |
 | What the model is doing right now | `GET /status` |
+| Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -353,3 +367,5 @@ The full story, with measurements, bottlenecks and what comes next: **[docs/pape
   `third_party/ggml/LICENSE`.
 - Ideas from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen); references in the paper.
+- The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see
+  `serve/web/fonts/OFL.txt`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
