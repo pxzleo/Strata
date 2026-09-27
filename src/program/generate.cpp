@@ -313,7 +313,7 @@ void usage() {
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
-                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
+                 "  --dump-routing PATH  write routed ids and weights per layer/position (native verify weights are zero)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -440,13 +440,19 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
         // anything keyed on the layer index, which is exactly what a cache profile is, would have been wrong.
         const int32_t layer_idx = (int32_t) (t->d.layers - 1);
         if (layer_idx < 0 || layer_idx >= 48) {
-            std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
+            t->d.failed = true;
+            t->d.fail = "the routing trace saw a layer outside 0..47";
+            t->d.fail_layer = layer_idx;
             return;
         }
         const int32_t rec[2] = {layer_idx, (int32_t) k};
-        std::fwrite(rec, sizeof rec, 1, t->routing);
-        std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
-        std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
+        if (std::fwrite(rec, sizeof rec, 1, t->routing) != 1 ||
+            std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing) != (size_t) k ||
+            std::fwrite(weights, sizeof(float), (size_t) k, t->routing) != (size_t) k) {
+            t->d.failed = true;
+            t->d.fail = "the routing trace could not be written";
+            t->d.fail_layer = layer_idx;
+        }
     }
 }
 
@@ -458,7 +464,21 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
-    ++t->calls;
+    t->calls += n_tok;
+    if (t->routing != nullptr && !t->d.failed) {
+        const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
+        const std::vector<float> weights((size_t) k, 0.0f);  // verify callback receives IDs only
+        for (int64_t tok = 0; tok < n_tok; ++tok) {
+            if (std::fwrite(rec, sizeof rec, 1, t->routing) != 1 ||
+                std::fwrite(ids + tok * k, sizeof(int32_t), (size_t) k, t->routing) != (size_t) k ||
+                std::fwrite(weights.data(), sizeof(float), (size_t) k, t->routing) != (size_t) k) {
+                t->d.failed = true;
+                t->d.fail = "the routing trace could not be written";
+                t->d.fail_layer = layer;
+                return;
+            }
+        }
+    }
 }
 
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
@@ -1196,6 +1216,7 @@ int main(int argc, char** argv) {
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
+            if (!auto_cache && sized_slots.size() >= (size_t) o.expert_cache) break;
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > cap) break;
             used += b;
@@ -2583,7 +2604,10 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
-                apply_pending(false);
+                // A pending refill may already be overwriting a slot that the device table still
+                // names as its old expert. Do not start another verify window until the copy
+                // finishes and both residency tables have been updated.
+                apply_pending(true);
                 if (hist_n > 0) {
                     // the tail the penalties count over: the tokens the state has consumed plus the fed-back
                     // head `x` (it joins `consumed` only after this window commits).  Most recent LAST,
@@ -3246,7 +3270,9 @@ int main(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
-            apply_pending(false);
+            // A pending refill may already be overwriting a slot that the device table still
+            // names as its old expert. Wait before the next verify window reads that slot.
+            apply_pending(true);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -3370,7 +3396,10 @@ int main(int argc, char** argv) {
                     (long long) g.n_layers, (unsigned long long) half_stride);
     }
     if (routing != nullptr) {
-        std::fclose(routing);
+        if (std::fclose(routing) != 0) {
+            std::fprintf(stderr, "strata generate: cannot finish routing trace %s\n", o.dump_routing.c_str());
+            return 1;
+        }
         drive.routing = nullptr;
         std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
                     o.dump_routing.c_str(), (long long) drive.calls);
