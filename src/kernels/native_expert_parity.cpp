@@ -8,6 +8,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
@@ -102,7 +103,7 @@ int main(int argc, char** argv) {
                 ffp[k] = ff[k].data();
             }
             cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
-            if (cpu::iq512_supported(f.gu_type)) {
+            if (cpu::cpu_avx512_ok() && cpu::iq512_supported(f.gu_type)) {
                 // the AVX-512 rows against ggml's own vec_dot, same Q8_K activations: float-order differences only
                 std::vector<float> g512((size_t) NT * FF), gref((size_t) NT * FF);
                 float* gp[NT];
@@ -144,7 +145,7 @@ int main(int argc, char** argv) {
                 op[k] = got_c.data() + k * H;
             }
             cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
-            if (f.d_type == 42) {
+            if (cpu::cpu_avx512_ok() && f.d_type == 42) {
                 // (b2) the AVX-512 GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections
                 std::vector<cpu::ActQ> a2(NT);
                 const cpu::ActQ* ap[NT];
