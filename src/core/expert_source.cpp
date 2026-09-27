@@ -296,8 +296,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
-        const uint8_t* dma_src[64];
-        int64_t pcie_i0[64];
+        const uint8_t* dma_src[128];
+        int64_t pcie_i0[128];
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
@@ -310,7 +310,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
                                                                                  : (size_t) slot * (size_t) d.cache_blob));
                 } else {
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
+                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 128) {
                         const uint8_t* src = d.src->blob(d.layers, e);
                         if (src != nullptr && d.src->pinned(d.layers, e)) {
                             kd = 1;
@@ -384,6 +384,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";
+                d.fail_layer = d.layers;
+                d.fail_expert = e;
+                return;
+            }
+            if (native && d.pcie_num == 256 && kind[i] < 0) {
+                d.failed = true;
+                d.fail = d.plan == nullptr || n > 128 || n > d.plan->cap ? "the native GPU expert plan is unavailable"
+                       : !d.src->pinned(d.layers, e) ? "the native expert arena is not fully pinned"
+                       : d.src->device_alias(d.layers, 0) == nullptr || d.src->device_alias(d.layers, e) == nullptr
+                             ? "the native expert has no GPU address"
+                       : "the native GPU expert staging capacity is exhausted";
                 d.fail_layer = d.layers;
                 d.fail_expert = e;
                 return;
