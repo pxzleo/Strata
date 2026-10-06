@@ -72,6 +72,8 @@ def main():
     ap.add_argument("--n", type=int, default=4, help="prompts (<= --batch)")
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--skip-solo", action="store_true")
+    ap.add_argument("--check-adapt", action="store_true",
+                    help="require adaptive cache updates and swaps in the completed batch (use a partial cache)")
     ap.add_argument("--keys", default="", help='sampling keys for every request, e.g. "temperature=0.7 top_k=20"')
     ap.add_argument("--extra", default="", help='more engine arguments in one string, e.g. "--adapt-every 1000000"')
     ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
@@ -154,6 +156,19 @@ def main():
         print("   ", ascii(tok.decode(b)[:160]))
     eng.send("QUIT")
     eng.p.wait(timeout=180)   # the next run needs the GPUs back
+    eng.log.close()
+    if eng.p.returncode != 0:
+        print(f"engine exited with code {eng.p.returncode}; see {eng.log_path}")
+        ok = False
+    if a.check_adapt:
+        import re
+        reports = re.findall(r"strata batch: adaptive cache: (\d+) updates, (\d+) swaps",
+                             Path(eng.log_path).read_text(errors="replace"))
+        updates = sum(int(u) for u, _ in reports)
+        swaps = sum(int(s) for _, s in reports)
+        adapted = updates > 0 and swaps > 0
+        print(f"batch adaptive cache: {updates} updates, {swaps} swaps: {'PASS' if adapted else 'FAIL'}")
+        ok &= adapted
     return 0 if ok else 2
 
 

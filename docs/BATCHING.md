@@ -113,6 +113,18 @@ counter-based draw (Philox(seed, position)).
 
 ## Limits (for now)
 
+Batch decoding updates the shared expert cache every `--adapt-every` completed windows, using the existing
+batch routing counts and `--adapt-swaps` and `--adapt-decay` settings. Pipelined groups also count their
+inactive padding rows, as the existing batch dispatch does. Updates wait until
+the prompt path returns any borrowed cache slots; a multi-GPU pipeline drains its in-flight windows before
+swapping experts. The copies finish before the next batch window starts. This also applies when only one
+slot remains active. It does not enable MTP in batch windows or increase the expert cache's capacity.
+The batch timing log reports the number of adaptive updates, primary/stage cache swaps (excluding helper
+and remote caches) and their total time when the slots become idle. To check actual swaps, run
+`tools/batch_test.py --skip-solo --check-adapt` with a partial expert
+cache and adaptive updates enabled; this check requires the model and a free GPU. No throughput improvement
+is claimed without a matched measurement.
+
 - Batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo path keeps
   its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
 - Repetition / frequency / presence penalties are not applied in batch windows.

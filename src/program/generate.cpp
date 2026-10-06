@@ -5908,6 +5908,38 @@ int main(int argc, char** argv) {
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
+        int64_t batch_adapt_rounds = 0, batch_adapt_updates = 0, batch_adapt_swaps = 0;
+        double batch_adapt_ms = 0;
+        auto batch_adapt_due = [&] {
+            return !drive.d.usage.empty() && batch_adapt_rounds >= o.adapt_every;
+        };
+        auto batch_may_adapt = [&] {
+            // A prompt's borrowed slots still contain buffers and must be refilled before any swap.
+            return std::all_of(pf_parts.begin(), pf_parts.end(), [](const PfPart& p) { return p.lent.empty(); });
+        };
+        auto batch_adapt = [&]() -> bool {
+            if (!batch_adapt_due() || !batch_may_adapt()) return true;
+            const auto t0 = Clock::now();
+            apply_pending(true);
+            if (!adapt()) {
+                std::printf("ERR a batch adaptive refill failed\n");
+                return false;
+            }
+            batch_adapt_swaps += (int64_t) pending.size();
+            // No batch window may read the residency table or an overwritten expert until the copies land.
+            apply_pending(true);
+            batch_adapt_rounds = 0;
+            ++batch_adapt_updates;
+            batch_adapt_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            return true;
+        };
+        auto batch_adapt_report = [&] {
+            if (batch_adapt_updates > 0)
+                std::fprintf(stderr, "strata batch: adaptive cache: %lld updates, %lld swaps, %.1f ms\n",
+                             (long long) batch_adapt_updates, (long long) batch_adapt_swaps, batch_adapt_ms);
+            batch_adapt_updates = batch_adapt_swaps = 0;
+            batch_adapt_ms = 0;
+        };
         auto try_next_line = [&](std::string& out) -> bool {
             std::lock_guard<std::mutex> lk(in_mu);
             if (in_lines.empty()) return false;
@@ -6037,6 +6069,8 @@ int main(int argc, char** argv) {
             }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
+            ++batch_adapt_rounds;
+            if (!batch_adapt()) return false;
             strata::core::progress().busy.store(was_busy);
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
@@ -6055,6 +6089,7 @@ int main(int argc, char** argv) {
                 }
                 bt_run = bt_commit = bt_emit = 0;
                 bt_windows = bt_rows = bt_tokens = 0;
+                batch_adapt_report();
             }
             return true;
         };
@@ -6121,8 +6156,11 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
                 ++bt_windows;
+                ++batch_adapt_rounds;
                 G.inflight = false;
             }
+            // Drain every stage before changing the shared expert tables and their cache slots.
+            if (!pipe_inflight() && !batch_adapt()) return false;
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
             for (int k = n_pipe - 1; k >= 0; --k) {
                 if (stage_group[(size_t) k] >= 0) continue;
@@ -6135,6 +6173,7 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                 } else {
                     if (!may_start) continue;
+                    if (batch_adapt_due() && batch_may_adapt()) continue;
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
                         if (!pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
@@ -6172,6 +6211,7 @@ int main(int argc, char** argv) {
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
                 }
                 bt_windows = bt_rows = 0;
+                batch_adapt_report();
                 strata::core::progress().busy.store(false);
             }
             return true;
