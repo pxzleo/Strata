@@ -189,7 +189,10 @@ function render(m) {
   } else {
     setPill("idle", "Idle");
   }
-  if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+  if (live.queued > 0 && !["reading", "generating"].includes(live.state)) setPill("queued", `${live.queued} queued`);
+  if (live.sessions != null) {
+    $("pill-text").textContent = `${live.sessions} sessions · ${live.queued_requests} queued · ${$("pill-text").textContent}`;
+  }
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "about") renderAbout(eng, hw, st);
@@ -237,33 +240,62 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
-  // model state
-  const on = live.queued > 0 ? "queued" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
-  const prog = $("state-progress");
+function renderSlot(slot, last) {
+  const row = document.createElement("div");
+  row.className = "state-slot";
+  const line = document.createElement("div");
+  line.className = "state-card__row";
+  const title = document.createElement("span"), info = document.createElement("span");
+  info.className = "muted";
+  line.append(title, info);
+  const prog = document.createElement("div"), bar = document.createElement("div");
+  prog.className = "st-progress";
+  bar.className = "st-progress__bar";
+  prog.append(bar);
+  row.append(line, prog);
   let label = "Waiting for a request", detail = "", pct = 0;
-  if (live.state === "reading") {
+  if (slot.state === "reading") {
     label = "Reading prompt";
     prog.dataset.tone = "info";
-    if (live.prompt_total) {
-      pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
+    if (slot.prompt_total) {
+      pct = (100 * slot.prompt_read) / slot.prompt_total;
+      detail = `${fmt(slot.prompt_read)} / ${fmt(slot.prompt_total)} tokens · ${fmt(pct)}%`;
     } else {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
+      detail = `${fmt(slot.prompt_tokens)} tokens`;
     }
-  } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
+  } else if (["generating", "decoding"].includes(slot.state)) {
+    label = slot.phase ? slot.phase[0].toUpperCase() + slot.phase.slice(1) : "Generating";
     delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+    pct = slot.max_tokens ? Math.min(100, (100 * slot.generated) / slot.max_tokens) : 0;
+    detail = `${fmt(slot.generated)} tokens · ${fmt(slot.tok_s, 1)} tok/s`;
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
-  $("state-label").textContent = label;
-  $("state-detail").textContent = detail;
-  $("state-bar").style.width = `${pct}%`;
+  if (slot.state === "idle") {
+    label = "Idle";
+    detail = slot.held_tokens ? `${fmt(slot.held_tokens)} cached tokens` : "";
+  }
+  if (slot.state === "waiting") {
+    label = "Queued";
+    detail = "Waiting to resume prompt";
+    prog.dataset.tone = "info";
+    pct = slot.prompt_total ? (100 * slot.prompt_read) / slot.prompt_total : 0;
+  }
+  title.textContent = `${slot.label} · ${label}`;
+  info.textContent = detail;
+  bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  return row;
+}
+
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+  // model state
+  const on = (live.queued_requests ?? live.queued) > 0 ? "queued" : live.state;
+  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
+  const rows = live.slots?.length ? live.slots.map(s => ({...s, label: `Slot ${s.slot + 1}`}))
+    : [{...live, label: "Slot 1"}];
+  if (live.solo) rows.unshift({...live.solo, label: "Solo"});
+  $("state-slots").replaceChildren(...rows.map(s => renderSlot(s, last)));
 
   // the eight cards
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;

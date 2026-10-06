@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve
+from serve.server import ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine, engine_args, parallel_args, serve
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -187,6 +187,59 @@ class PickSlot(unittest.TestCase):
         self.assertEqual(v[0]["state"], "decoding")
         self.assertEqual(v[0]["generated"], 4)
         self.assertEqual(v[1], {"slot": 1, "state": "idle", "held_tokens": 2})
+
+
+class SlotMetrics(unittest.TestCase):
+    def test_counts_include_engine_waiters_and_solo_path(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "Hello.", max_context=4096)
+        engine.batch = 2
+        slots = [{"slot": 0, "state": "decoding"}, {"slot": 1, "state": "reading"}]
+        engine.slots_view = lambda: slots
+        engine.solo_live = None
+        svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        svc.live_reqs = {i: ({"busy": True}, []) for i in range(3)}
+        live = svc.metrics()["live"]
+        self.assertEqual((live["sessions"], live["executing"], live["queued_requests"]), (3, 2, 1))
+        slots[1]["state"] = "waiting"
+        live = svc.metrics()["live"]
+        self.assertEqual((live["executing"], live["queued_requests"]), (1, 2))
+        slots[:] = [{"slot": i, "state": "idle"} for i in range(2)]
+        engine.solo_live = {"state": "reading", "generated": 0, "first_token": None}
+        live = svc.metrics()["live"]
+        self.assertEqual((live["sessions"], live["executing"], live["queued_requests"]), (3, 1, 2))
+        self.assertEqual(live["solo"]["state"], "reading")
+        engine.solo_live.update(generated=101, generated_base=100, first_token=time.time() - 1)
+        self.assertLess(svc.metrics()["live"]["solo"]["tok_s"], 2)
+        svc.live_reqs.clear()
+        engine.solo_live = None
+        live = svc.metrics()["live"]
+        self.assertEqual((live["sessions"], live["executing"], live["queued_requests"]), (0, 0, 0))
+
+    def test_serial_counts_keep_fifo_waiters(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "Hello.", max_context=4096), tok,
+                      ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        svc.status.update(busy=True, queued=2)
+        live = svc.metrics()["live"]
+        self.assertEqual((live["sessions"], live["executing"], live["queued_requests"]), (3, 1, 2))
+
+    def test_loading_request_is_counted_and_failure_clears_it(self):
+        for batch in (0, 2):
+            with self.subTest(batch=batch):
+                tok = ByteTokenizer()
+                engine = MockEngine(tok, "Hello.", max_context=4096)
+                engine.batch = batch
+                engine.slots_view = lambda: [{"slot": i, "state": "idle"} for i in range(batch)]
+                svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+                def loading():
+                    live = svc.metrics()["live"]
+                    self.assertEqual((live["sessions"], live["queued_requests"]), (1, 1))
+                    raise EngineDied("test loading failure")
+                with mock.patch.object(svc, "ensure_loaded", side_effect=loading):
+                    with self.assertRaisesRegex(EngineDied, "test loading failure"):
+                        list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
+                self.assertEqual(svc.metrics()["live"]["sessions"], 0)
 
 
 class ParallelService(unittest.TestCase):

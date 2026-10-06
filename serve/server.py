@@ -504,6 +504,7 @@ class StrataEngine:
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+        self.solo_live = None                           # the independent GEN path, outside the batch slots
         self.slot_cv = threading.Condition()
         self.waiting = 0                                # requests waiting for the control lines (ctl)
         self.wait_lens: list[list[int]] = []            # ... their prompt lengths (a long read gives way to short ones)
@@ -714,7 +715,7 @@ class StrataEngine:
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
-    def _control(self, cancel, on_token, stop_when=None):
+    def _control(self, cancel, on_token, stop_when=None, live=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE)."""
@@ -734,6 +735,10 @@ class StrataEngine:
                 btrace("ctl<", self._ctl_mode, line.strip()[:60])
             if line.startswith("T "):
                 on_token(int(line[2:]))
+                if live is not None:
+                    live.update(state="decoding", generated=live["generated"] + 1)
+                    if live["first_token"] is None:
+                        live["first_token"] = time.time()
                 if not stopped and (cancel.is_set() or (stop_when is not None and stop_when())):
                     self._send("STOP")
                     stopped = True
@@ -742,6 +747,8 @@ class StrataEngine:
                 f = line.split()
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                     self.progress = (int(f[1]), int(f[2]))
+                    if live is not None:
+                        live.update(prompt_read=int(f[1]), prompt_total=int(f[2]))
                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                 yield None
             elif line.startswith("DONE"):
@@ -894,6 +901,10 @@ class StrataEngine:
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
+                    self.solo_live = {"state": "reading", "prompt_tokens": len(prompt), "generated": len(out),
+                                      "generated_base": len(out),
+                                      "max_tokens": int(max_new), "started": time.time(), "first_token": None,
+                                      "prompt_read": None, "prompt_total": None}
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
@@ -901,7 +912,8 @@ class StrataEngine:
                     def others():
                         with self.slot_cv:
                             return self.waiting > 0
-                    for x in self._control(cancel, pending.append, stop_when=others):
+                    solo_live = self.solo_live
+                    for x in self._control(cancel, pending.append, stop_when=others, live=solo_live):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
@@ -917,12 +929,14 @@ class StrataEngine:
                                     self._send(f"BYIELD {reserved}")
                             yield None
                     phase = "none"                          # its DONE is read
+                    self.solo_live = None
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
+                        self.slot_live[slot] = {**solo_live, "slot": slot, "state": "waiting"}
                     elif reserved is not None:              # it did not give way: the slot is free again
                         with self.slot_cv:
                             self.slot_busy[reserved] = False
@@ -949,6 +963,8 @@ class StrataEngine:
                                     return
                     if self._yielded is not None:           # it gave way: the others waiting then go first
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
+                        if self.slot_live[slot] is not None:
+                            self.slot_live[slot]["state"] = "waiting"
                         self._yielded = None
                         yields += 1
                         self.ctl.release()
@@ -962,15 +978,17 @@ class StrataEngine:
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
-                    live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
-                            "started": time.time(), "first_token": None}
+                    live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": len(out),
+                            "generated_base": len(out),
+                            "started": time.time(), "first_token": None, "max_tokens": int(max_new),
+                            "prompt_read": None, "prompt_total": None}
                     self.slot_live[slot] = live
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     asked = False
-                    for x in self._control(cancel, pending.append):
+                    for x in self._control(cancel, pending.append, live=live):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
@@ -994,7 +1012,9 @@ class StrataEngine:
                 holding = False
                 if not cont:
                     return
-                live.update(state="decoding", first_token=time.time(), generated=len(out))
+                live.update(state="decoding", generated=len(out))
+                if live["first_token"] is None:
+                    live["first_token"] = time.time()
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
@@ -1060,6 +1080,7 @@ class StrataEngine:
             except EngineDied:
                 pass
             if holding:
+                self.solo_live = None
                 self.ctl.release()
             if reserved is not None:
                 with self.slot_cv:
@@ -1102,8 +1123,11 @@ class StrataEngine:
                 continue
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
+                          "prompt_read": r.get("prompt_read"), "prompt_total": r.get("prompt_total"),
+                          "max_tokens": r.get("max_tokens"),
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
+                          "tok_s": round((r["generated"] - r.get("generated_base", 0)) / max(1e-6, now - ft), 1)
+                          if ft else None})
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -2060,8 +2084,21 @@ class Service:
             in_slots = sum(1 for x in slots if x["state"] != "idle")
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0))
+            solo = getattr(self.engine, "solo_live", None)
+            live["solo"] = dict(solo) if solo is not None else None
+            if live["solo"] is not None:
+                ft = solo.get("first_token")
+                live["solo"]["tok_s"] = round((solo["generated"] - solo.get("generated_base", 0)) /
+                                              max(1e-6, now - ft), 1) if ft else None
+            executing = min(running, sum(x["state"] not in ("idle", "waiting") for x in slots)
+                            + int(solo is not None))
+            live.update(sessions=running + live["queued"], executing=executing,
+                        queued_requests=live["queued"] + max(0, running - executing))
             if running and state == "idle":
                 live["state"] = "generating"
+        else:
+            live.update(sessions=int(bool(s.get("busy"))) + live["queued"],
+                        executing=int(bool(s.get("busy"))), queued_requests=live["queued"])
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
@@ -2267,6 +2304,7 @@ class Service:
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
             self.status["queued"] += 1
+        queued_pending = True
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
@@ -2275,12 +2313,13 @@ class Service:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
-                        self.status["queued"] -= 1
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
                     with self.status_lock:
+                        self.status["queued"] -= 1
+                        queued_pending = False
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new)
@@ -2456,6 +2495,9 @@ class Service:
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
         finally:
+            if queued_pending:
+                with self.status_lock:
+                    self.status["queued"] -= 1
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in parser.finish():
