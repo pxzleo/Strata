@@ -19,6 +19,13 @@ asked, with a note when it is more than setup would recommend.
 "parallel": 2
 ```
 
+On one GPU with MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `STRATA_BATCH_MTP=1` in the
+server's environment) selects the upstream grouped path: each batch slot verifies one MTP proposal per window. Its
+implementation differs from this checkout's default shared-drafter MTP, described below. It needs VRAM per slot for the draft state and buffers, so
+check the engine's free-memory log before using it on a smaller card. If it cannot run (one slot, no `--mtp`, a layer
+split or helper GPU) the engine says so and batches as usual. RTX PRO 5000 owners measured +31% to +39% total
+throughput with 2 to 4 clients (a RX R9700 run too); it has not been validated with a layer split.
+
 With a layer split, the engine options go into the config's `args`:
 
 ```
@@ -28,7 +35,7 @@ With a layer split, the engine options go into the config's `args`:
 
 | Option | What it does |
 | --- | --- |
-| `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. |
+| `"parallel": N` / `--batch N` / `--slots N` (2..8 normally) | up to N conversations have batch slots; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. With grouped MTP, more than 8 slots can rotate through eight-row windows if memory permits. |
 | `--batch-groups G` | with a layer split: the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
 | `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
 
@@ -51,6 +58,11 @@ slots, and the slots may take at most a fifth of it, up to 4 slots. With Q2_0 at
 card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split. Everywhere else (any 12 or 16 GB
 card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
 about 10-25% speed per request on this card". `--parallel N` is honoured as asked either way.
+
+The local default shares draft weights and scratch, keeps separate slot K/V, and permits sixteen verifier rows
+in two kernel groups. `--batch-mtp` selects the upstream eight-row rotation implementation with a separate drafter
+per slot (shared weights after binding), one proposal per slot, and a bounded graph cache. Both paths retain
+adaptive expert cache updates. This merge has not established a throughput improvement for either path.
 
 ## How the server uses the slots
 
