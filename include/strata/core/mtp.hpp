@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <map>
 
 namespace strata::core {
 
@@ -73,6 +74,13 @@ public:
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+    /// Separate draft K/V per batch slot; weights and scratch remain shared. Allocate before sizing the expert cache.
+    bool init_slots(int count, std::string& err);
+    bool copy_to_slot(int slot, int64_t upto, std::string& err);
+    bool copy_from_slot(int slot, int64_t upto, std::string& err);
+    bool draft_slot(int slot, int T, const float* residuals, const int32_t* tokens, int64_t p, int a,
+                    int depth, SessionState* session, const strata::kernels::SamplerParams& sampling,
+                    int32_t* drafts, std::string& err, float* probs = nullptr, float min_p = 0.0f);
 
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
@@ -107,12 +115,11 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
-    cudaGraphExec_t step_exec_[9] = {};
+    std::map<int, cudaGraphExec_t> step_exec_;
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
-    cudaGraphExec_t round_exec_c_[9] = {};
-    cudaGraphExec_t step_exec_c_[9] = {};
+    std::map<int, cudaGraphExec_t> round_exec_c_, step_exec_c_;
     bool coupled_ok_ = false, coupled_active_ = false;
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
     int coupled_j_ = 0;
@@ -135,11 +142,15 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t prefill_exec_[9] = {};
-    cudaGraphExec_t prefill_dev_exec_[9] = {};
+    std::map<int, cudaGraphExec_t> prefill_exec_, prefill_dev_exec_;
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
-    cudaGraphExec_t round_exec_[9] = {};
+    std::map<int, cudaGraphExec_t> round_exec_;
+    int draft_slot_ = -1;
+    int graph_key(int row) const { return (draft_slot_ + 1) * 9 + row; }
+    std::vector<QsaState> slot_states_;
+    std::vector<void*> slot_arenas_;
+    float* slot_R_ = nullptr;
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;

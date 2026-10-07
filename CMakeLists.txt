@@ -654,6 +654,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # the prompt path's DeltaNet recurrence: gdn_rec_kh_kernel against gdn_rec_cols_pipe_kernel, bitwise (GPU,
   # synthetic, no model; --bench adds timings).  NVIDIA only: cp.async and the CUDA occupancy API (not on gfx906)
   if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+    # Mapped-RAM expert staging, bytewise vs the original kernel; --bench alternates graph timings.
+    add_executable(fetch_blobs_bench src/kernels/fetch_blobs_bench.cu)
+    target_include_directories(fetch_blobs_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(fetch_blobs_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME fetch_blobs_bench COMMAND fetch_blobs_bench)
     add_executable(gdn_rec_parity src/prefill/gdn_rec_parity.cu)
     target_link_libraries(gdn_rec_parity PRIVATE ${_strata_gpu_runtime_target})
     add_test(NAME gdn_rec_parity COMMAND gdn_rec_parity)

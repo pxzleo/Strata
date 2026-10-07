@@ -82,6 +82,30 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
+
+
+def _record_rate(rate, generated, now=None):
+    now = time.time() if now is None else now
+    rate.append((now, generated))
+    while len(rate) > 1 and rate[1][0] <= now - RATE_WINDOW_S:
+        rate.popleft()                      # retain the counter just before the window
+
+
+def _token_rate(state, rate, now=None):
+    first = state.get("first_token")
+    if (not state.get("busy", state.get("state") == "decoding") or first is None or not rate
+            or state.get("phase") == "reading the prompt"):
+        return 0.0
+    now = time.time() if now is None else now
+    start = max(first, now - RATE_WINDOW_S)
+    base = state.get("generated_base", 0)
+    if first < start:
+        for stamp, generated in rate:
+            if stamp > start:
+                break
+            base = generated
+    return max(0.0, (rate[-1][1] - base) / max(RATE_MIN_SPAN_S, now - start))
+
 # #481: a running request whose engine prints nothing (no T, PP or any other line) for this long has lost step with the
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
 # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
@@ -739,6 +763,7 @@ class StrataEngine:
                     live.update(state="decoding", generated=live["generated"] + 1)
                     if live["first_token"] is None:
                         live["first_token"] = time.time()
+                    _record_rate(live.setdefault("rate", collections.deque()), live["generated"])
                 if not stopped and (cancel.is_set() or (stop_when is not None and stop_when())):
                     self._send("STOP")
                     stopped = True
@@ -1033,6 +1058,7 @@ class StrataEngine:
                         t = int(line.split()[2])
                         out.append(t)
                         live["generated"] = len(out)
+                        _record_rate(live.setdefault("rate", collections.deque()), live["generated"])
                         if cancel.is_set():
                             if not stop_sent:
                                 self._send(f"BSTOP {slot}")
@@ -1126,7 +1152,7 @@ class StrataEngine:
                           "prompt_read": r.get("prompt_read"), "prompt_total": r.get("prompt_total"),
                           "max_tokens": r.get("max_tokens"),
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                          "tok_s": round((r["generated"] - r.get("generated_base", 0)) / max(1e-6, now - ft), 1)
+                          "tok_s": round(_token_rate(r, list(r.get("rate", ())), now), 1)
                           if ft else None})
         return view
 
@@ -1701,7 +1727,7 @@ class Service:
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
-        self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
+        self.rate = collections.deque()                # time-bounded samples plus the preceding counter
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
@@ -1992,14 +2018,7 @@ class Service:
 
     @staticmethod
     def _rate_of(s, rate):
-        if not s.get("busy") or not s.get("first_token"):
-            return 0.0
-        now = time.time()
-        newest = rate[-1] if rate else None
-        oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
-        if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
-            return max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
-        return s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
+        return _token_rate(s, rate)
 
     def _tok_s_mean(self):
         """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
@@ -2011,7 +2030,8 @@ class Service:
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
         with self.status_lock:
-            reading = self.status.get("busy") and self.status.get("first_token") is None
+            reading = self.status.get("busy") and (self.status.get("first_token") is None
+                                                   or self.status.get("phase") == "reading the prompt")
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
     def begin_request(self, path, req):
@@ -2056,7 +2076,7 @@ class Service:
             totals = dict(self.totals)
         now = time.time()
         progress = getattr(self.engine, "progress", None)
-        if s.get("busy") and s.get("first_token") is None:
+        if s.get("busy") and (s.get("first_token") is None or s.get("phase") == "reading the prompt"):
             state = "reading"
         elif s.get("busy"):
             state = "generating"
@@ -2088,8 +2108,13 @@ class Service:
             live["solo"] = dict(solo) if solo is not None else None
             if live["solo"] is not None:
                 ft = solo.get("first_token")
-                live["solo"]["tok_s"] = round((solo["generated"] - solo.get("generated_base", 0)) /
-                                              max(1e-6, now - ft), 1) if ft else None
+                rate = live["solo"].pop("rate", ())
+                live["solo"]["tok_s"] = round(_token_rate(solo, list(rate), now), 1) if ft else None
+            if any(x["state"] == "decoding" for x in slots) or (solo and solo["state"] == "decoding"):
+                live["state"] = "generating"
+            if live["state"] == "generating":
+                live["tok_s"] = round(sum(x.get("tok_s") or 0.0 for x in slots)
+                                      + ((live["solo"] or {}).get("tok_s") or 0.0), 1)
             executing = min(running, sum(x["state"] not in ("idle", "waiting") for x in slots)
                             + int(solo is not None))
             live.update(sessions=running + live["queued"], executing=executing,
@@ -2248,7 +2273,9 @@ class Service:
             s["generated"] = n
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
-            (self.rate if rate is None else rate).append((time.time(), n))   # the live rate's window (RATE_WINDOW_S)
+            if s.get("phase") == "reading the prompt":
+                s["phase"] = "generating"
+            _record_rate(self.rate if rate is None else rate, n)
             for ev in evs:
                 if ev.kind == "reasoning":
                     s["phase"] = "thinking"
@@ -2268,7 +2295,7 @@ class Service:
         with self.status_lock:
             s = dict(self.status if st is None else st)
         el = now - s.get("started", now)
-        if s.get("first_token") is None:
+        if s.get("first_token") is None or s.get("phase") == "reading the prompt":
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
             print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
@@ -2301,7 +2328,7 @@ class Service:
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
-        rate = collections.deque(maxlen=32) if par else self.rate
+        rate = collections.deque() if par else self.rate
         with self.status_lock:
             self.status["queued"] += 1
         queued_pending = True
@@ -2332,6 +2359,8 @@ class Service:
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     while True:
+                        with self.status_lock:
+                            st["phase"] = "reading the prompt"
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed

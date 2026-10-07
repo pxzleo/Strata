@@ -340,6 +340,10 @@ app. It has three tabs:
   Model state shows a separate progress bar for every batch slot, plus the independent solo path when in use.
   The header shows current requests (executing plus queued) and queued requests before the current phase.
   These count requests, not saved chats; an idle slot's cached conversation is not an active request.
+  Speed's **Decode now** shows the current aggregate decode rate, and zero while no tokens are being generated
+  (reading the prompt, queued or idle). Completed-request average rates remain in the request history.
+  Each slot and the Solo path use the same two-second window as Speed. The total is their displayed rates added
+  together; a paused path falls to zero when no token remains in that window. Historical request rates stay averages.
 - **About:** the model and engine settings, and the addresses to connect other apps.
 
 `http://127.0.0.1:8080/?q=your question` opens it with a new chat already asking. The API is at

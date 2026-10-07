@@ -2,7 +2,7 @@
 
 By default Strata serves **one request at a time**: the others wait in the server's queue. With `"parallel": N`
 (the engine's `--batch N`, also spelled `--slots N`) the engine keeps up to N conversations open and decodes them
-**together**: every verify window then carries one token of each conversation, so the dense weights, the shared
+**together**: every verify window carries each conversation's anchor token and, with batch MTP, its drafts. The dense weights, the shared
 expert, the head and every routed expert two conversations share are read once per window for all of them.
 Combined with a layer split across several GPUs and `--batch-groups`, the cards also work on different
 conversations at the same time instead of waiting for each other.
@@ -33,7 +33,7 @@ With a layer split, the engine options go into the config's `args`:
 | `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can - at most 8 slots (a
-window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit. The server reads
+kernel group holds at most 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit. The server reads
 the count the engine reports (`INFO batch_slots=N`), and `GET /v1/status` says it (`concurrency.serving`).
 
 ### What a slot costs, and what setup recommends
@@ -57,12 +57,12 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
 - **One request alone** runs on the usual solo path (verify windows with MTP drafts): the fastest single stream.
 - **When a second request arrives**, the first is stopped (`STOP`) and continues in a batch slot with its prompt
   plus what it generated so far - the engine's prompt cache holds exactly that, so nothing is read again - and the
-  new request is admitted next to it. A request in a slot decodes **without MTP drafts** (one token per window).
+  new request is admitted next to it. With MTP enabled and one batch group, slots verify their drafts together.
+  Each slot keeps its own draft K/V and commits only its accepted prefix. The draft weights and scratch are shared.
 - **A request left alone in a slot** (the others finished, nobody waits) goes back to the solo path: the slot is
   stopped, the engine copies its sessions back and decodes with MTP drafts again (at most twice per request; with
-  `--prompt-cache 0` it stays in the slot; `STRATA_PARALLEL_SOLO=0` turns it off). The draft layer's own K/V was
-  built for another conversation then, but measured it accepted as many drafts (140 of 172) as a draft layer that
-  read the conversation (140 of 173).
+  `--prompt-cache 0` it stays in the slot; `STRATA_PARALLEL_SOLO=0` turns it off). With slot MTP enabled,
+  the slot's draft K/V is also copied back, including when restoring an earlier conversation checkpoint.
 - **More requests than slots** wait for a free one (`/metrics` -> `live.slots` shows each slot: idle, reading or
   decoding, its tokens and tok/s; `live.running` the requests in flight).
 - **Each admission** reads the request's prompt through the usual prompt path (prompt cache and conversation
@@ -118,15 +118,44 @@ batch routing counts and `--adapt-swaps` and `--adapt-decay` settings. Pipelined
 inactive padding rows, as the existing batch dispatch does. Updates wait until
 the prompt path returns any borrowed cache slots; a multi-GPU pipeline drains its in-flight windows before
 swapping experts. The copies finish before the next batch window starts. This also applies when only one
-slot remains active. It does not enable MTP in batch windows or increase the expert cache's capacity.
+slot remains active. Cache updates do not increase the expert cache's capacity.
 The batch timing log reports the number of adaptive updates, primary/stage cache swaps (excluding helper
 and remote caches) and their total time when the slots become idle. To check actual swaps, run
 `tools/batch_test.py --skip-solo --check-adapt` with a partial expert
 cache and adaptive updates enabled; this check requires the model and a free GPU. No throughput improvement
 is claimed without a matched measurement.
 
-- Batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo path keeps
-  its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
+- MTP in batch windows has a sixteen-row verifier capacity. With S active slots, each slot gets at most
+  `min(--spec, floor(16/S))` rows, including its anchor token, further limited by `--mtp-max-t`, remaining output,
+  context and draft confidence. With `--spec 4`, four slots can each verify three drafts. Windows above eight
+  rows use two computation groups of at most eight rows; a slot crossing their boundary replays its recurrence
+  prefix and keeps the same attention and PLE history. The draft
+  history still advances when no draft fits, and when a slot finishes. More draft depth becomes available as slots
+  finish. `--batch-groups > 1` retains one-token pipeline windows. The batch log reports accepted/offered drafts
+  per slot and emitted tokens/s separately from verifier rows/s. A batch PLE hashing bug previously passed only
+  one pair of history tokens for several rows. Hashing each row with its own preceding tokens fixed the accepted
+  prefix mismatch: on 2026-10-07, Qwen3.8-Flash-Next-Uncensored Q4_K_S on an RTX 4090, four questions of
+  128 tokens, 8,435 fixed expert cache entries, PCIe fraction 0, adaptation disabled and every second draft
+  corrupted, the eight-row candidate changed from zero to four exact matches against solo output.
+  Under the same settings, the sixteen-row candidate matched solo output for 4, 3 and 2 slots, with both normal
+  drafts and every second draft corrupted (128 tokens per question). The three-slot window crosses a slot's
+  span between the two computation groups. Normal four-slot output took 13.98 s for 512 tokens, including
+  admissions (36.6 tokens/s); this is one short run with a 2K context, not a production speedup measurement.
+  Forcing every draft to be rejected also matched solo output for 4 and 3 slots (64 tokens per question).
+  With PCIe fraction 0.3 and every second draft corrupted, all seven 32-token outputs completed, but three
+  differed from solo output at token 28 or 29 (zero-based). This is a runtime check, not an exactness pass.
+  The sixteen-row candidate was deployed locally on 2026-10-07 with the original 262K context and four-slot
+  configuration. Four concurrent HTTP requests each completed 128 tokens in 12.08 s overall; the log confirmed
+  sixteen-row windows and accepted MTP drafts in every slot. The earlier binary and configuration were backed up.
+  Later that day, the user requested a temporary return to the backed-up production binary for testing. That
+  binary retains batch expert cache updates but does not enable batch MTP; the sixteen-row candidate is preserved.
+  The next trial uses the PLE-fixed eight-row candidate with four slots and `--mtp-max-t 2`: each slot verifies
+  its anchor and at most one MTP draft, including when fewer slots remain active. Context and cache settings
+  remain unchanged; throughput must be measured separately from the sixteen-row trial.
+  Four concurrent HTTP requests of 128 tokens each completed in 10.62 s (48.2 tokens/s overall) with the
+  eight-row trial, against 12.08 s for the earlier sixteen-row HTTP check using the same prompts. The batch log
+  confirmed eight rows and 220 accepted of 286 drafts (76.9%). This is one short deployment check, not a
+  completed long-request benchmark.
 - Repetition / frequency / presence penalties are not applied in batch windows.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
@@ -190,7 +219,7 @@ tests the server's side with a scripted engine (no GPU).
 
 | Script | What it checks |
 | --- | --- |
-| `tools/batch_test.py` | the same prompts alone (`GEN`) and together in the batch slots (`BGEN`): every slot's greedy tokens equal its solo tokens; prints the aggregate rate. `--batch-groups` in `--extra` tests the pipeline, `--keys "temperature=0.7"` the sampled rows. |
+| `tools/batch_test.py` | the same prompts alone (`GEN`) and together in the batch slots (`BGEN`): every slot's greedy tokens equal its solo tokens; prints the aggregate rate. `--check-mtp` requires offered and accepted drafts in every slot; `--spec-corrupt 1` in `--extra` forces rejection. `--batch-groups` tests the pipeline, `--keys "temperature=0.7"` the sampled rows. |
 | `tools/batch_interleave_test.py` | a long prompt read while two slots decode, a prompt that gives way (`BYIELD`) and goes on, and a next turn continued from its slot: each equal to its solo tokens. |
 | `tools/parking_test.py` | a follow-up to a conversation decodes the same tokens whether its state stayed live or came back from the parking cache (with a layer split: every stage's image). |
 | `tools/early_close_test.py` | a client that stops reading a streamed answer early (alone, and with a second request running) does not leave its tokens to the next request (server). |
@@ -206,6 +235,33 @@ python3 tools/parking_test.py --exe engine/strata --config strata-<model>.json \
     --extra "--layer-split 12,24,36 --conversation-cache-mib 8192 --conversation-cache-slots 4 --pcie-frac 0"
 STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8080
 ```
+
+## RAM expert staging check (NVIDIA)
+
+Build `fetch_blobs_bench` and run it for bytewise copy and destination-guard checks; `--bench` also alternates
+the original and current kernels in CUDA graphs, using a 256 MiB mapped RAM source pool. On an RTX 4090 48GB
+with CUDA 13.3, removing the copy loop's division by blob size gave no measurable improvement for 1-7 experts
+(about -0.3% to +0.2% throughput), and lost 7.7% for 16 experts, with 3 MiB + 16-byte blobs. The original kernel
+is retained. These are staging-only measurements, not model decode throughput.
+
+`STRATA_PCIE_OVERLAP=1` stages missed experts on the verifier's copy stream while the main stream computes
+resident experts. The main stream waits for staging before computing missed experts. This is opt-in and
+only applies to kernel PCIe mode; DMA and direct mode keep their existing paths. Internal GPU stage profiling
+also keeps the serial path so its stage timestamps retain their meaning.
+
+On an RTX 4090 48GB, CUDA 13.3, Q4_K_S, four slots and an eight-row window with one MTP draft per slot,
+three repeated runs of four requests at 1024 output tokens each gave 110.2 tokens/s median with overlap off
+and 111.6 tokens/s with it on, including request admission. Both used the same executable, xhigh reasoning,
+temperature zero and identical warmup sequences. The 1.3% difference does not establish a speedup: cache
+adaptation affected early runs, and repeated outputs differed even with overlap off. MTP acceptance was
+74.4% off and 74.9% on. Keep overlap off by default pending a repeatable gain.
+
+A separate Nsight trace with cache adaptation disabled and all missed experts assigned to the GPU showed
+80.3% of staging-kernel time overlapping native expert computation. This confirms concurrency under that
+configuration; its instrumented throughput is not part of the comparison above.
+Four 128-token greedy requests under that fixed plan matched in two cases across off/on; repeating the off
+run also changed two outputs. Token-for-token equivalence remains unverified, and these short,
+length-limited checks do not establish answer accuracy.
 
 ## Engine protocol (`--serve`)
 

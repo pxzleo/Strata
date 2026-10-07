@@ -11,11 +11,13 @@ import threading
 import time
 import unittest
 import urllib.request
+from collections import deque
 from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine, engine_args, parallel_args, serve
+from serve.server import _record_rate, _token_rate
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -189,7 +191,63 @@ class PickSlot(unittest.TestCase):
         self.assertEqual(v[1], {"slot": 1, "state": "idle", "held_tokens": 2})
 
 
+class TokenRates(unittest.TestCase):
+    def test_recent_window_excludes_old_tokens_and_counts_pauses(self):
+        state = {"state": "decoding", "first_token": 90.0, "generated": 160}
+        rate = deque([(98.0, 100), (99.0, 130), (100.0, 160)])
+        self.assertEqual(_token_rate(state, rate, 100.0), 30.0)
+        self.assertEqual(_token_rate(state, rate, 102.0), 0.0)
+        _record_rate(rate, 161, 102.1)
+        self.assertEqual(list(rate), [(100.0, 160), (102.1, 161)])
+        self.assertEqual(_token_rate(state, rate, 102.1), 0.5)
+        state["state"] = "waiting"
+        self.assertEqual(_token_rate(state, rate, 102.1), 0.0)
+
+    def test_new_phase_excludes_tokens_from_the_previous_path(self):
+        state = {"state": "decoding", "first_token": 100.0, "generated": 1001, "generated_base": 1000}
+        self.assertEqual(_token_rate(state, [(100.0, 1001)], 100.0), 4.0)
+
+    def test_fast_output_keeps_the_entire_two_second_window(self):
+        rate = deque()
+        for i in range(401):
+            _record_rate(rate, i, 100.0 + i / 100)
+        self.assertEqual(len(rate), 201)
+        self.assertEqual(_token_rate({"busy": True, "first_token": 100.0}, rate, 104.0), 100.0)
+
+
 class SlotMetrics(unittest.TestCase):
+    def test_second_prefill_hides_old_speed_without_resetting_request_mean(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "Hello.", max_context=4096), tok,
+                      ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        svc.status.update(busy=True, phase="reading the prompt", first_token=90.0, generated=110)
+        svc.rate.extend([(98.0, 100), (99.0, 110)])
+        with mock.patch("serve.server.time.time", return_value=100.0):
+            self.assertEqual(svc.metrics()["live"]["state"], "reading")
+            self.assertEqual(svc._tok_s(), 0.0)
+            self.assertEqual(svc._tok_s_mean(), 11.0)
+            svc._note(111, [])
+            self.assertEqual(svc.metrics()["live"]["state"], "generating")
+            self.assertEqual(svc._tok_s(), 5.5)
+            self.assertEqual(svc.status["first_token"], 90.0)
+
+    def test_total_equals_slot_and_solo_rates_without_internal_samples(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "Hello.", max_context=4096)
+        engine.batch = 1
+        engine.slots_view = lambda: [{"slot": 0, "state": "decoding", "tok_s": 30.0}]
+        engine.solo_live = {"state": "decoding", "generated": 1220, "generated_base": 1000,
+                            "first_token": 90.0, "rate": deque([(98.0, 1200), (100.0, 1220)])}
+        svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        svc.live_reqs = {i: ({"busy": True}, []) for i in range(2)}
+        with mock.patch("serve.server.time.time", return_value=100.0):
+            live = svc.metrics()["live"]
+        self.assertEqual(live["state"], "generating")
+        self.assertEqual(live["solo"]["tok_s"], 10.0)
+        self.assertEqual(live["tok_s"], 40.0)
+        self.assertNotIn("rate", live["solo"])
+        json.dumps(live)
+
     def test_counts_include_engine_waiters_and_solo_path(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "Hello.", max_context=4096)

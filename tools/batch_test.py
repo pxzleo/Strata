@@ -74,6 +74,7 @@ def main():
     ap.add_argument("--skip-solo", action="store_true")
     ap.add_argument("--check-adapt", action="store_true",
                     help="require adaptive cache updates and swaps in the completed batch (use a partial cache)")
+    ap.add_argument("--check-mtp", action="store_true", help="require offered and accepted MTP drafts for every slot")
     ap.add_argument("--keys", default="", help='sampling keys for every request, e.g. "temperature=0.7 top_k=20"')
     ap.add_argument("--extra", default="", help='more engine arguments in one string, e.g. "--adapt-every 1000000"')
     ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
@@ -169,6 +170,16 @@ def main():
         adapted = updates > 0 and swaps > 0
         print(f"batch adaptive cache: {updates} updates, {swaps} swaps: {'PASS' if adapted else 'FAIL'}")
         ok &= adapted
+    if a.check_mtp:
+        import re
+        reports = re.findall(r"strata batch: slot (\d+) MTP: (\d+) accepted of (\d+) drafts",
+                             Path(eng.log_path).read_text(errors="replace"))
+        counts = {int(slot): (int(accepted), int(offered)) for slot, accepted, offered in reports}
+        for slot in got:
+            accepted, offered = counts.get(slot, (0, 0))
+            valid = 0 < accepted <= offered
+            print(f"slot {slot} MTP: {accepted} accepted of {offered}: {'PASS' if valid else 'FAIL'}")
+            ok &= valid
     return 0 if ok else 2
 
 

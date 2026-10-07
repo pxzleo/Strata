@@ -39,6 +39,9 @@
 
 namespace strata::core {
 
+/// Packed rows across slots; each slot and each kernel group still holds at most 8 tokens.
+inline constexpr int kBatchMaxRows = 16;
+
 class NativeHead;
 class RemoteExpertOpt;
 
@@ -75,7 +78,8 @@ public:
     /// the flags guarded, so this verifier refuses every later window.  True when the streams finished.
     bool release_gpu_waits(int timeout_ms);
 
-    /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
+    /// Row capacity <= kBatchMaxRows; solo windows and each slot's span remain <= kVerifyMaxT.
+    /// `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
 
@@ -130,7 +134,7 @@ public:
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
-    // A batch window holds S INDEPENDENT sequences, one token each: row s is slot s, at slot s's own position,
+    // A batch window holds independent sequences; consecutive rows may belong to the same slot at consecutive positions,
     // reading and writing slot s's own state (GDN recurrence and conv history, QSA K/V and indexer, PLE history),
     // which lives in `slots[s]` - a session carved like this verifier's own (same layer range, same max_cells).
     // Everything that is per row already (hyper-connections, dense projections, router, shared expert, the
@@ -138,19 +142,21 @@ public:
     // per window for all the sequences.  Row s's arithmetic is the single-token window's, so a slot's greedy
     // tokens are its solo greedy tokens (modulo the multi-token CPU kernel choice: STRATA_IQ_MT_MIN=1).
     //
-    // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
+    // `init_slots` once after `init` (S <= max_t); packed draft windows commit each slot's licensed prefix. A layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
     int n_slots() const { return (int) slots_.size(); }
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err);
-    /// The same over the S slots `rows` (row t is slot rows[t], any distinct slots in any order): the slots not
+    /// The same over S rows (row t is slot rows[t], each slot occupies one consecutive span): the slots not
     /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).
     bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user,
                        int32_t* out, std::string& err);
     /// Keep every row of the last batch window: each slot's state advances by its one token.
     bool commit_slots(std::string& err);
+    /// Packed windows may contain consecutive rows of the same slot. Keep the requested prefix per slot.
+    bool commit_slots(const int* keep, std::string& err);
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -219,13 +225,22 @@ private:
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
-    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
-    bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
+    int brow_[kBatchMaxRows] = {};          ///< ... and row t is slot brow_[t]
+    bool last_batch_ = false;              ///< the last run was a batch window (one or two kernel groups)
     std::map<uint64_t, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< key: batch_key(rows, S, hand-off base)
-    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int last_rows_[kBatchMaxRows] = {};     ///< the slots of the last batch window's rows
+    int batch_span(const int* rows, int count, int first) const {
+        int end = first + 1;
+        while (end < count && rows[end] == rows[first]) ++end;
+        return end - first;
+    }
+    int batch_start(const int* rows, int first) const {
+        while (first > 0 && rows[first - 1] == rows[first]) --first;
+        return first;
+    }
     static uint64_t batch_key(const int* rows, int S, int hbase) {
-        uint64_t k = (uint64_t) hbase << 40 | (uint64_t) S << 32;
-        for (int t = 0; t < S; ++t) k |= (uint64_t) (rows[t] & 15) << (4 * t);
+        uint64_t k = (uint64_t) hbase << 53 | (uint64_t) S << 48;
+        for (int t = 0; t < S; ++t) k |= (uint64_t) rows[t] << (3 * t);
         return k;
     }
     // batch_launch / batch_poll
@@ -239,7 +254,7 @@ private:
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
-    int64_t last_pos_b_[8] = {};
+    int64_t last_pos_b_[kBatchMaxRows] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
@@ -289,14 +304,15 @@ private:
     SessionState* ss_ = nullptr;
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;
-    int max_t_ = 0;
+    int max_t_ = 0;                        ///< allocated row capacity/stride; solo graphs still hold <=8 rows
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[kBatchMaxRows] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    cudaEvent_t pcie_fork_ = nullptr, pcie_join_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
 
@@ -316,7 +332,7 @@ private:
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
-    cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    cudaStream_t copy_ = nullptr;                                 // DMA or kernel staging of missed experts
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);

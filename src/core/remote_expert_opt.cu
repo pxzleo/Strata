@@ -1,6 +1,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/verify.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -55,12 +56,12 @@ void RemoteExpertOpt::attach(RemoteExperts& remote) {
 
 bool RemoteExpertOpt::init(std::string& err) {
     void* mapped = nullptr;
-    if (!check(cudaHostAlloc((void**) &h_sum_, MAXT * (H + K) * sizeof(float),
+    if (!check(cudaHostAlloc((void**) &h_sum_, kBatchMaxRows * (H + K) * sizeof(float),
                              cudaHostAllocPortable | cudaHostAllocMapped), err) ||
         !check(cudaHostGetDevicePointer(&mapped, h_sum_, 0), err)) return false;
     m_sum_ = (float*) mapped;
-    h_mask_ = reinterpret_cast<int32_t*>(h_sum_ + MAXT * H);
-    m_mask_ = reinterpret_cast<int32_t*>(m_sum_ + MAXT * H);
+    h_mask_ = reinterpret_cast<int32_t*>(h_sum_ + kBatchMaxRows * H);
+    m_mask_ = reinterpret_cast<int32_t*>(m_sum_ + kBatchMaxRows * H);
     for (auto& p : peers_) {
         const OnDevice on(p.remote->device_);
         if (!check(cudaMalloc((void**) &p.sum, MAXT * H * sizeof(float)), err)) return false;
