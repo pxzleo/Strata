@@ -39,8 +39,8 @@
 
 namespace strata::core {
 
-/// Packed rows across slots; each slot and each kernel group still holds at most 8 tokens.
-inline constexpr int kBatchMaxRows = 16;
+/// Packed rows across slots; the whole batch window holds at most 8 tokens.
+inline constexpr int kBatchMaxRows = 8;
 
 class NativeHead;
 class RemoteExpertOpt;

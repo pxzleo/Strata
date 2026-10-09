@@ -59,8 +59,8 @@ card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split
 card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
 about 10-25% speed per request on this card". `--parallel N` is honoured as asked either way.
 
-The local default shares draft weights and scratch, keeps separate slot K/V, and permits sixteen verifier rows
-in two kernel groups. `--batch-mtp` selects the upstream eight-row rotation implementation with a separate drafter
+The local default shares draft weights and scratch, keeps separate slot K/V, and permits eight verifier rows
+in one kernel group. `--batch-mtp` selects the upstream eight-row rotation implementation with a separate drafter
 per slot (shared weights after binding), one proposal per slot, and a bounded graph cache. Both paths retain
 adaptive expert cache updates. This merge has not established a throughput improvement for either path.
 
@@ -137,11 +137,10 @@ and remote caches) and their total time when the slots become idle. To check act
 cache and adaptive updates enabled; this check requires the model and a free GPU. No throughput improvement
 is claimed without a matched measurement.
 
-- MTP in batch windows has a sixteen-row verifier capacity. With S active slots, each slot gets at most
-  `min(--spec, floor(16/S))` rows, including its anchor token, further limited by `--mtp-max-t`, remaining output,
-  context and draft confidence. With `--spec 4`, four slots can each verify three drafts. Windows above eight
-  rows use two computation groups of at most eight rows; a slot crossing their boundary replays its recurrence
-  prefix and keeps the same attention and PLE history. The draft
+- MTP in batch windows has an eight-row verifier capacity. With S active slots, each slot gets at most
+  `min(--spec, floor(8/S))` rows, including its anchor token, further limited by `--mtp-max-t`, remaining output,
+  context and draft confidence. With `--spec 4 --mtp-max-t 4`, one or two active slots can each verify up to three
+  MTP drafts; three or four active slots can each verify up to one. The draft
   history still advances when no draft fits, and when a slot finishes. More draft depth becomes available as slots
   finish. `--batch-groups > 1` retains one-token pipeline windows. The batch log reports accepted/offered drafts
   per slot and emitted tokens/s separately from verifier rows/s. A batch PLE hashing bug previously passed only
